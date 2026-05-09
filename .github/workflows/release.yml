@@ -42,8 +42,10 @@ jobs:
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-musicli.git" tap
 
           VERSION=${TAG#v}
+          sed -i "s|YOUR_GITHUB_USERNAME|${OWNER}|g"                                      tap/Formula/musicli.rb
           sed -i "s|/archive/refs/tags/.*\.tar\.gz\"|/archive/refs/tags/${TAG}.tar.gz\"|" tap/Formula/musicli.rb
-          sed -i "s|sha256 \"FILL_IN.*\"|sha256 \"${SHA256}\"|"                           tap/Formula/musicli.rb
+          # Replace only the *first* sha256 in the file (the formula-level one, not the resource ones)
+          sed -i "0,/sha256 \"[^\"]*\"/{s|sha256 \"[^\"]*\"|sha256 \"${SHA256}\"|}" tap/Formula/musicli.rb
 
           cd tap
           # Explicitly set remote with token so push doesn't fall back to GITHUB_TOKEN
