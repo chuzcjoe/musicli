@@ -455,7 +455,13 @@ def get_input(session, prompt_str: str) -> str:
 
 # ── Main REPL ─────────────────────────────────────────────────────────────────
 
+VERSION = "1.0.0"
+
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-v'):
+        print(f"musicli {VERSION}")
+        sys.exit(0)
+
     print(BANNER)
 
     if not shutil.which('yt-dlp') or not get_player() or not HAS_PTK:
