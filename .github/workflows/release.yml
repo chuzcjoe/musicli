@@ -39,14 +39,15 @@ jobs:
         run: |
           # Clone the tap repo  (needs TAP_TOKEN secret with repo write access)
           OWNER=$(echo "$REPO" | cut -d/ -f1)
-          git clone "https://${TAP_TOKEN}@github.com/${OWNER}/homebrew-musicli.git" tap
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-musicli.git" tap
 
           VERSION=${TAG#v}
           sed -i "s|/archive/refs/tags/.*\.tar\.gz\"|/archive/refs/tags/${TAG}.tar.gz\"|" tap/Formula/musicli.rb
           sed -i "s|sha256 \"FILL_IN.*\"|sha256 \"${SHA256}\"|"                           tap/Formula/musicli.rb
-          sed -i "s|version \".*\"|version \"${VERSION}\"|"                                tap/Formula/musicli.rb
 
           cd tap
+          # Explicitly set remote with token so push doesn't fall back to GITHUB_TOKEN
+          git remote set-url origin "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-musicli.git"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/musicli.rb
