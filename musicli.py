@@ -11,6 +11,12 @@ import os
 import socket
 import threading
 import contextlib
+import http.server
+import hashlib
+import base64
+import secrets
+import time
+import webbrowser
 from typing import List, Dict, Optional
 
 # ── Optional: prompt_toolkit for live suggestions ─────────────────────────────
@@ -406,6 +412,251 @@ def play_queue(queue: List[Dict]) -> List[Dict]:
     return queue
 
 
+# ── Auth (Google OAuth 2.0 PKCE) ─────────────────────────────────────────────
+#
+# Create credentials at: console.cloud.google.com → APIs & Services → Credentials
+# Application type: Desktop app.  Then set the two env vars below.
+
+_GOOGLE_CLIENT_ID     = os.environ.get('MUSICLI_GOOGLE_CLIENT_ID', '')
+_GOOGLE_CLIENT_SECRET = os.environ.get('MUSICLI_GOOGLE_CLIENT_SECRET', '')
+_GOOGLE_SCOPES        = 'openid email profile'
+_AUTH_FILE            = os.path.expanduser('~/.config/musicli/auth.json')
+
+
+def _load_auth() -> Optional[Dict]:
+    try:
+        with open(_AUTH_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _save_auth(data: Dict) -> None:
+    os.makedirs(os.path.dirname(_AUTH_FILE), exist_ok=True)
+    with open(_AUTH_FILE, 'w') as f:
+        json.dump(data, f)
+
+
+def _pkce_pair() -> tuple:
+    verifier  = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b'=').decode()
+    return verifier, challenge
+
+
+def _exchange_code(code: str, verifier: str, redirect_uri: str) -> Optional[Dict]:
+    body = urllib.parse.urlencode({
+        'client_id':     _GOOGLE_CLIENT_ID,
+        'client_secret': _GOOGLE_CLIENT_SECRET,
+        'code':          code,
+        'code_verifier': verifier,
+        'grant_type':    'authorization_code',
+        'redirect_uri':  redirect_uri,
+    }).encode()
+    req = urllib.request.Request(
+        'https://oauth2.googleapis.com/token',
+        data=body, method='POST',
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _fetch_user_info(access_token: str) -> Optional[Dict]:
+    req = urllib.request.Request(
+        'https://www.googleapis.com/oauth2/v3/userinfo',
+        headers={'Authorization': f'Bearer {access_token}'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def _do_token_refresh(refresh_tok: str) -> Optional[Dict]:
+    body = urllib.parse.urlencode({
+        'client_id':     _GOOGLE_CLIENT_ID,
+        'client_secret': _GOOGLE_CLIENT_SECRET,
+        'refresh_token': refresh_tok,
+        'grant_type':    'refresh_token',
+    }).encode()
+    req = urllib.request.Request(
+        'https://oauth2.googleapis.com/token',
+        data=body, method='POST',
+        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def get_current_user() -> Optional[Dict]:
+    """Return cached user info, transparently refreshing the access token if needed."""
+    auth = _load_auth()
+    if not auth:
+        return None
+    if time.time() < auth.get('expires_at', 0) - 60:
+        return auth.get('user_info')
+    refresh = auth.get('refresh_token')
+    if refresh and _GOOGLE_CLIENT_ID and _GOOGLE_CLIENT_SECRET:
+        new_tok = _do_token_refresh(refresh)
+        if new_tok and 'access_token' in new_tok:
+            auth.update(new_tok)
+            auth['expires_at'] = time.time() + new_tok.get('expires_in', 3600)
+            if not new_tok.get('refresh_token'):
+                auth['refresh_token'] = refresh
+            _save_auth(auth)
+            return auth.get('user_info')
+    with contextlib.suppress(OSError):
+        os.unlink(_AUTH_FILE)
+    return None
+
+
+def login_with_google() -> Optional[Dict]:
+    """Run the Google OAuth PKCE flow in the browser; return user_info on success."""
+    if not _GOOGLE_CLIENT_ID or not _GOOGLE_CLIENT_SECRET:
+        print(f"\n  {c(C.RED, 'Google OAuth not configured.')}")
+        print(f"  {c(C.DIM, 'Set MUSICLI_GOOGLE_CLIENT_ID and MUSICLI_GOOGLE_CLIENT_SECRET.')}\n")
+        return None
+
+    with socket.socket() as _s:
+        _s.bind(('localhost', 0))
+        port = _s.getsockname()[1]
+
+    redirect_uri        = f'http://localhost:{port}/callback'
+    verifier, challenge = _pkce_pair()
+    state               = secrets.token_urlsafe(16)
+    auth_code: list     = [None]
+    stop_event          = threading.Event()
+
+    auth_url = (
+        'https://accounts.google.com/o/oauth2/v2/auth?'
+        + urllib.parse.urlencode({
+            'client_id':             _GOOGLE_CLIENT_ID,
+            'redirect_uri':          redirect_uri,
+            'response_type':         'code',
+            'scope':                 _GOOGLE_SCOPES,
+            'state':                 state,
+            'code_challenge':        challenge,
+            'code_challenge_method': 'S256',
+            'access_type':           'offline',
+            'prompt':                'select_account',
+        })
+    )
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed    = urllib.parse.urlparse(self.path)
+            params    = urllib.parse.parse_qs(parsed.query)
+            code      = params.get('code', [None])[0]
+            got_state = params.get('state', [None])[0]
+
+            if parsed.path == '/callback' and code and got_state == state:
+                auth_code[0] = code
+                body = (
+                    b'<html><body style="font-family:system-ui;text-align:center;'
+                    b'padding:80px;background:#f6fef9">'
+                    b'<h2 style="color:#2d6a4f">&#10003; Login successful!</h2>'
+                    b'<p style="color:#555">You can close this tab and return to the terminal.</p>'
+                    b'</body></html>'
+                )
+                self.send_response(200)
+                stop_event.set()
+            else:
+                body = b''
+                self.send_response(204)
+
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_):
+            pass
+
+    server     = http.server.HTTPServer(('localhost', port), _Handler)
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+
+    print(f"\n  {c(C.DIM, 'Opening browser for Google login…')}")
+    webbrowser.open(auth_url)
+    print(f"  {c(C.DIM, 'Waiting for login… (Ctrl+C to cancel)')}\n")
+
+    try:
+        stop_event.wait(timeout=120)
+    except KeyboardInterrupt:
+        print(f"\n  {c(C.YELLOW, 'Login cancelled.')}\n")
+        server.shutdown()
+        server.server_close()
+        return None
+
+    server.shutdown()
+    server.server_close()
+
+    if not auth_code[0]:
+        print(f"  {c(C.YELLOW, 'Login timed out or was cancelled.')}\n")
+        return None
+
+    tokens = _exchange_code(auth_code[0], verifier, redirect_uri)
+    if not tokens or 'access_token' not in tokens:
+        print(f"  {c(C.RED, 'Failed to exchange auth code for tokens.')}\n")
+        return None
+
+    user_info = _fetch_user_info(tokens['access_token'])
+    if not user_info:
+        print(f"  {c(C.RED, 'Failed to get user info.')}\n")
+        return None
+
+    _save_auth({
+        **tokens,
+        'user_info':  user_info,
+        'expires_at': time.time() + tokens.get('expires_in', 3600),
+    })
+    return user_info
+
+
+def do_logout() -> None:
+    with contextlib.suppress(OSError):
+        os.unlink(_AUTH_FILE)
+    print(f"  {c(C.GREEN, '✓')} Logged out.\n")
+
+
+def show_welcome() -> Optional[Dict]:
+    """Show login / guest choice; return user_info or None (guest)."""
+    existing = get_current_user()
+    if existing:
+        name = existing.get('name') or existing.get('email', 'there')
+        print(f"\n  {c(C.GREEN, '✓')} Welcome back, {c(C.BOLD, name)}!\n")
+        return existing
+
+    print(f"\n  {c(C.BOLD, 'How would you like to continue?')}\n")
+    print(f"  {c(C.CYAN, '1.')} Continue as guest")
+    print(f"  {c(C.CYAN, '2.')} Log in with Google\n")
+
+    try:
+        choice = input(f"  {c(C.DIM, 'Your choice [1/2]:')} ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return None
+
+    if choice == '2':
+        user = login_with_google()
+        if user:
+            name = user.get('name') or user.get('email', 'there')
+            print(f"  {c(C.GREEN, '✓')} Logged in as {c(C.BOLD, name)}!\n")
+        return user
+
+    print()
+    return None
+
+
 # ── Help & banner ─────────────────────────────────────────────────────────────
 
 BANNER = f"""
@@ -420,6 +671,10 @@ HELP = f"""
     {c(C.CYAN, 'play')}             play queue from start
     {c(C.CYAN, 'queue')}            show current queue
     {c(C.CYAN, 'clear')}            clear queue
+
+  {c(C.BOLD, 'Account')}
+    {c(C.CYAN, 'login')}            log in with Google
+    {c(C.CYAN, 'logout')}           log out of your account
 
   {c(C.BOLD, 'Other')}
     {c(C.CYAN, 'help')}             show this message
@@ -468,6 +723,8 @@ def main() -> None:
         print(f"\n  {c(C.YELLOW, 'Dependencies:')}")
         check_deps()
 
+    current_user = show_welcome()
+
     print(HELP)
 
     session   = make_session()
@@ -494,6 +751,18 @@ def main() -> None:
 
         if low in ('help', 'h', '?'):
             print(HELP)
+            continue
+
+        if low == 'login':
+            current_user = login_with_google()
+            if current_user:
+                name = current_user.get('name') or current_user.get('email', 'there')
+                print(f"  {c(C.GREEN, '✓')} Logged in as {c(C.BOLD, name)}!\n")
+            continue
+
+        if low == 'logout':
+            do_logout()
+            current_user = None
             continue
 
         if low == 'queue':
