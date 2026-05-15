@@ -31,6 +31,7 @@ class Musicli < Formula
     venv.pip_install resources
 
     libexec.install "musicli.py"
+    libexec.install "recommender.py"
 
     # Wrapper script placed in PATH — users just type `musicli`
     (bin/"musicli").write <<~SH

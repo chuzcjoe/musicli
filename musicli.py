@@ -17,7 +17,12 @@ import base64
 import secrets
 import time
 import webbrowser
+import select
+import tty
+import termios
 from typing import List, Dict, Optional
+
+from recommender import SessionRecommender
 
 # ── Optional: prompt_toolkit for live suggestions ─────────────────────────────
 try:
@@ -97,7 +102,11 @@ def fetch_suggestions(query: str) -> List[str]:
         return []
 
 
-_COMMANDS = {'quit', 'exit', 'q', ':q', 'help', 'h', '?', 'queue', 'play', 'clear'}
+_COMMANDS = {
+    'quit', 'exit', 'q', ':q', 'help', 'h', '?',
+    'queue', 'play', 'clear',
+    'login', 'logout',
+}
 
 class YTSuggestCompleter(Completer):
     def get_completions(self, document, complete_event):
@@ -280,18 +289,16 @@ def _render_bar(pos: float, dur: float, paused: bool) -> str:
 
 def _play_mpv_ipc(url: str) -> None:
     """Run mpv with an IPC socket; stream live time-pos/duration/pause to a progress bar."""
-    sock_path  = f"/tmp/musicli-{os.getpid()}.sock"
-    stop_evt   = threading.Event()
+    sock_path = f"/tmp/musicli-{os.getpid()}.sock"
+    stop_evt  = threading.Event()
 
-    # Print the initial progress line without a newline so \r can overwrite it.
     print(f"  {c(C.GREEN + C.BOLD, '▶')}  [{'░' * _BAR_W}]  0:00 / ?:??", end='', flush=True)
 
     def ipc_loop() -> None:
-        # Wait up to 5 s for mpv to create the socket file.
         for _ in range(50):
             if os.path.exists(sock_path):
                 break
-            import time; time.sleep(0.1)
+            time.sleep(0.1)
         else:
             return
 
@@ -304,7 +311,6 @@ def _play_mpv_ipc(url: str) -> None:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(sock_path)
             sock.settimeout(1.0)
-            # Ask mpv to push updates whenever these properties change.
             for obs_id, prop in [(1, 'time-pos'), (2, 'duration'), (3, 'pause')]:
                 cmd = json.dumps({'command': ['observe_property', obs_id, prop]}) + '\n'
                 sock.sendall(cmd.encode())
@@ -364,14 +370,14 @@ def _play_mpv_ipc(url: str) -> None:
         t.join(timeout=2.0)
         with contextlib.suppress(OSError):
             os.unlink(sock_path)
-        print()   # end the progress line
-        print()   # blank line
+        print()
+        print()
 
 
 # ── Playback ──────────────────────────────────────────────────────────────────
 
 def play(song: Dict) -> None:
-    url = f"https://www.youtube.com/watch?v={song['id']}"
+    url    = f"https://www.youtube.com/watch?v={song['id']}"
     player = get_player()
 
     if not player:
@@ -406,10 +412,73 @@ def play(song: Dict) -> None:
     print(f"  {c(C.DIM, 'Done.')}\n")
 
 
-def play_queue(queue: List[Dict]) -> List[Dict]:
+def play_queue(queue: List[Dict], on_play=None) -> List[Dict]:
     while queue:
-        play(queue.pop(0))
+        song = queue.pop(0)
+        play(song)
+        if on_play:
+            on_play(song)
     return queue
+
+
+def _wait_for_cancel(seconds: float) -> bool:
+    """Sleep up to *seconds*; return True if the user pressed 'q' (or Ctrl+C)."""
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except Exception:
+        # No real TTY available — fall back to a plain sleep.
+        try:
+            time.sleep(seconds)
+        except KeyboardInterrupt:
+            return True
+        return False
+
+    try:
+        tty.setcbreak(fd)
+        deadline = time.time() + seconds
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            try:
+                r, _, _ = select.select([fd], [], [], remaining)
+            except KeyboardInterrupt:
+                return True
+            if not r:
+                return False
+            try:
+                ch = os.read(fd, 1)
+            except OSError:
+                return False
+            if ch in (b'q', b'Q', b'\x03'):   # q / Q / Ctrl+C
+                return True
+            # any other key is ignored; keep waiting
+    finally:
+        with contextlib.suppress(Exception):
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def autoplay_loop(queue: List[Dict], recommender: SessionRecommender) -> None:
+    """Keep playing recommended songs while the queue stays empty.
+
+    Stops when the recommender returns nothing or the user presses 'q' during
+    the "up next" countdown.
+    """
+    while not queue:
+        rec = recommender.recommend()
+        if not rec:
+            return
+        print(
+            f"  {c(C.CYAN + C.BOLD, '♪')} Up next: "
+            f"{c(C.BOLD, rec['title'])}  "
+            f"{c(C.DIM, '(press q to cancel)')}"
+        )
+        if _wait_for_cancel(2.5):
+            print(f"  {c(C.DIM, 'Auto-play stopped.')}\n")
+            return
+        play(rec)
+        recommender.record(rec)
 
 
 # ── Auth (Google OAuth 2.0 PKCE) ─────────────────────────────────────────────
@@ -657,6 +726,7 @@ def show_welcome() -> Optional[Dict]:
     return None
 
 
+
 # ── Help & banner ─────────────────────────────────────────────────────────────
 
 BANNER = f"""
@@ -725,13 +795,15 @@ def main() -> None:
 
     current_user = show_welcome()
 
-    print(HELP)
+    print(f"  {c(C.DIM, 'Search for a song to get started. Type')} "
+          f"{c(C.CYAN, 'help')} {c(C.DIM, 'to see all commands.')}\n")
 
     session   = make_session()
     prompt_str = f"{c(C.BOLD + C.BLUE, '  ♪')}  "
 
-    results: List[Dict] = []
-    queue:   List[Dict] = []
+    results:     List[Dict]         = []
+    queue:       List[Dict]         = []
+    recommender: SessionRecommender = SessionRecommender()
 
     while True:
         try:
@@ -778,7 +850,8 @@ def main() -> None:
             if not queue:
                 print(f"  {c(C.YELLOW, 'Queue is empty. Add songs with +<number>.')}\n")
             else:
-                queue = play_queue(queue)
+                queue = play_queue(queue, on_play=recommender.record)
+                autoplay_loop(queue, recommender)
             continue
 
         if raw.startswith('+') and raw[1:].isdigit():
@@ -798,6 +871,8 @@ def main() -> None:
                 print(f"  {c(C.YELLOW, 'Search for something first.')}\n")
             elif 0 <= idx < len(results):
                 play(results[idx])
+                recommender.record(results[idx])
+                autoplay_loop(queue, recommender)
             else:
                 print(f"  {c(C.YELLOW, f'Enter a number between 1 and {len(results)}.')}\n")
             continue

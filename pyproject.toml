@@ -15,4 +15,4 @@ dependencies = ["prompt_toolkit>=3.0"]
 musicli = "musicli:main"
 
 [tool.setuptools]
-py-modules = ["musicli"]
+py-modules = ["musicli", "recommender"]
