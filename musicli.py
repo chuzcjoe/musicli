@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """musicli - YouTube music player for the terminal"""
 
+import re
 import subprocess
 import sys
 import shutil
@@ -112,12 +113,13 @@ class YTSuggestCompleter(Completer):
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor.strip()
 
-        # Don't suggest for short input, numbers, queue-add syntax, or commands
+        # Don't suggest for short input, numbers, queue-add syntax, URLs, or commands
         if (
             not text
             or len(text) < 2
             or text.isdigit()
             or text.startswith('+')
+            or '://' in text
             or text.lower() in _COMMANDS
         ):
             return
@@ -162,6 +164,84 @@ def search(query: str, n: int = 10) -> List[Dict]:
                 'channel':  parts[3] if len(parts) > 3 else '—',
             })
     return songs
+
+
+# ── YouTube URL ───────────────────────────────────────────────────────────────
+
+_YT_HOSTS = {
+    'youtube.com', 'www.youtube.com', 'm.youtube.com',
+    'music.youtube.com', 'youtu.be', 'www.youtu.be',
+}
+_VIDEO_ID_RE = re.compile(r'[A-Za-z0-9_-]{11}')
+
+
+def parse_youtube_url(text: str) -> Optional[str]:
+    """If *text* is a YouTube link, return its 11-char video id; else None."""
+    text = text.strip()
+    if not text or ' ' in text:
+        return None
+    # Allow links pasted without a scheme (e.g. "youtu.be/…").
+    if '://' not in text:
+        if not text.lower().startswith(('youtu.be/', 'youtube.com/',
+                                        'www.youtube.com/', 'm.youtube.com/',
+                                        'music.youtube.com/')):
+            return None
+        text = 'https://' + text
+
+    try:
+        u = urllib.parse.urlparse(text)
+    except ValueError:
+        return None
+    if (u.hostname or '').lower() not in _YT_HOSTS:
+        return None
+
+    vid = None
+    if (u.hostname or '').lower() in ('youtu.be', 'www.youtu.be'):
+        vid = u.path.lstrip('/').split('/')[0]
+    elif u.path == '/watch':
+        vid = urllib.parse.parse_qs(u.query).get('v', [None])[0]
+    elif u.path.startswith(('/embed/', '/shorts/', '/live/', '/v/')):
+        segs = u.path.strip('/').split('/')
+        vid = segs[1] if len(segs) > 1 else None
+
+    if vid and _VIDEO_ID_RE.fullmatch(vid):
+        return vid
+    return None
+
+
+def fetch_video(video_id: str) -> Optional[Dict]:
+    """Resolve a single video id to a song dict (same shape as search results)."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    print(f"  {c(C.DIM, 'Loading…')}", end='\r', flush=True)
+    try:
+        r = subprocess.run(
+            [
+                'yt-dlp', url,
+                '--no-playlist',
+                '--print', '%(title)s\t%(id)s\t%(duration_string)s\t%(channel)s',
+                '--quiet',
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        print(f"\n  {c(C.RED, 'yt-dlp not found.')}  Install: pip install yt-dlp")
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print(f"\n  {c(C.YELLOW, 'Loading timed out. Try again.')}")
+        return None
+
+    print(' ' * 40, end='\r')
+
+    line = next((l for l in r.stdout.splitlines() if l.strip()), '')
+    parts = line.split('\t')
+    if len(parts) < 2 or not parts[1]:
+        return None
+    return {
+        'title':    parts[0] or 'Unknown title',
+        'id':       parts[1],
+        'duration': parts[2] if len(parts) > 2 and parts[2] else '—',
+        'channel':  parts[3] if len(parts) > 3 and parts[3] else '—',
+    }
 
 
 # ── Display ───────────────────────────────────────────────────────────────────
@@ -737,7 +817,9 @@ HELP = f"""
   {c(C.BOLD, 'Search & play')}
     {c(C.CYAN, '<query>')}          search YouTube  {c(C.DIM, '(suggestions appear as you type)')}
     {c(C.CYAN, '<number>')}         play a result immediately
+    {c(C.CYAN, '<youtube-url>')}    paste a YouTube link to play it
     {c(C.CYAN, '+<number>')}        add result to queue
+    {c(C.CYAN, '+<youtube-url>')}   add a YouTube link to queue
     {c(C.CYAN, 'play')}             play queue from start
     {c(C.CYAN, 'queue')}            show current queue
     {c(C.CYAN, 'clear')}            clear queue
@@ -875,6 +957,22 @@ def main() -> None:
                 autoplay_loop(queue, recommender)
             else:
                 print(f"  {c(C.YELLOW, f'Enter a number between 1 and {len(results)}.')}\n")
+            continue
+
+        # Paste a YouTube URL → play it now, or "+<url>" to add it to the queue.
+        to_queue = raw.startswith('+')
+        video_id = parse_youtube_url(raw[1:] if to_queue else raw)
+        if video_id:
+            song = fetch_video(video_id)
+            if not song:
+                print(f"  {c(C.RED, 'Could not load that video.')}\n")
+            elif to_queue:
+                queue.append(song)
+                print(f"  {c(C.GREEN, '+')} Added: {song['title']}\n")
+            else:
+                play(song)
+                recommender.record(song)
+                autoplay_loop(queue, recommender)
             continue
 
         query = raw.removeprefix('search ').strip()
