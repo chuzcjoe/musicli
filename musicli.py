@@ -862,7 +862,7 @@ def get_input(session, prompt_str: str) -> str:
 
 # ── Main REPL ─────────────────────────────────────────────────────────────────
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] in ('--version', '-v'):
